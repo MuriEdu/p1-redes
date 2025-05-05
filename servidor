@@ -3,26 +3,210 @@ import asyncio
 from tcp import Servidor
 import re
 
+nicknames = {}  
+channels = {}  
 
 def validar_nome(nome):
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
-
 def sair(conexao):
-    print(conexao, 'conexão fechada')
+    if conexao.registered:
+        common_channels = conexao.channels.copy()
+        for channel_lower in common_channels:
+            if channel_lower in channels and conexao in channels[channel_lower]:
+                channels[channel_lower].remove(conexao)
+                quit_msg = b':' + conexao.nick + b' QUIT :Connection closed\r\n'
+                for member in channels[channel_lower]:
+                    member.enviar(quit_msg)
+                if not channels[channel_lower]:
+                    del channels[channel_lower]
+        if conexao.nick:
+            nick_lower = conexao.nick.lower()
+            if nicknames.get(nick_lower) == conexao:
+                del nicknames[nick_lower]
     conexao.fechar()
-
+    print(conexao, 'conexão fechada')
 
 def dados_recebidos(conexao, dados):
     if dados == b'':
-        return sair(conexao)
-    print(conexao, dados)
+        sair(conexao)
+        return
+    conexao.buffer += dados
+    while True:
+        idx = conexao.buffer.find(b'\r\n')
+        if idx == -1:
+            break
+        line = conexao.buffer[:idx]
+        conexao.buffer = conexao.buffer[idx+2:]
+        process_line(conexao, line)
 
+def process_line(conexao, line):
+    parts = line.split()
+    if not parts:
+        return
+    command = parts[0].upper()
+    if command == b'PING':
+        handle_ping(conexao, parts)
+    elif command == b'NICK':
+        handle_nick(conexao, parts)
+    elif command == b'PRIVMSG':
+        handle_privmsg(conexao, parts, line)
+    elif command == b'JOIN':
+        handle_join(conexao, parts)
+    elif command == b'PART':
+        handle_part(conexao, parts)
+
+def handle_ping(conexao, parts):
+    payload = b' '.join(parts[1:]) if len(parts) >= 2 else b''
+    response = b':server PONG server :' + payload + b'\r\n'
+    conexao.enviar(response)
+
+def handle_nick(conexao, parts):
+    if len(parts) < 2:
+        send_error(conexao, b'431', b'*', b'No nickname given')
+        return
+    requested_nick = parts[1]
+    if not validar_nome(requested_nick):
+        current_nick = conexao.nick or b'*'
+        send_error(conexao, b'432', current_nick + b' ' + requested_nick, b'Erroneous nickname')
+        return
+    requested_lower = requested_nick.lower()
+    existing_con = nicknames.get(requested_lower)
+    if existing_con is not None and existing_con != conexao:
+        current_nick = conexao.nick or b'*'
+        send_error(conexao, b'433', current_nick + b' ' + requested_nick, b'Nickname is already in use')
+        return
+    old_nick = conexao.nick
+    if old_nick:
+        old_lower = old_nick.lower()
+        if nicknames.get(old_lower) == conexao:
+            del nicknames[old_lower]
+    nicknames[requested_lower] = conexao
+    conexao.nick = requested_nick
+    if not conexao.registered:
+        conexao.registered = True
+        send_welcome(conexao)
+    else:
+        notify_nick_change(conexao, old_nick, requested_nick)
+
+def send_error(conexao, code, params, message):
+    msg = b':server ' + code + b' ' + params + b' :' + message + b'\r\n'
+    conexao.enviar(msg)
+
+def send_welcome(conexao):
+    msg1 = b':server 001 ' + conexao.nick + b' :Welcome\r\n'
+    msg2 = b':server 422 ' + conexao.nick + b' :MOTD File is missing\r\n'
+    conexao.enviar(msg1 + msg2)
+
+def notify_nick_change(conexao, old_nick, new_nick):
+    msg = b':' + old_nick + b' NICK ' + new_nick + b'\r\n'
+    conexao.enviar(msg)
+    common_channels = conexao.channels.copy()
+    for channel_lower in common_channels:
+        channel = channels.get(channel_lower)
+        if not channel:
+            continue
+        for member in channel:
+            if member != conexao:
+                member.enviar(msg)
+
+def handle_privmsg(conexao, parts, line):
+    if not conexao.registered or len(parts) < 3:
+        return
+    recipient = parts[1]
+    content = b' '.join(parts[2:])
+    if content.startswith(b':'):
+        content = content[1:]
+    sender = conexao.nick
+    if not sender:
+        return
+    msg = b':' + sender + b' PRIVMSG ' + recipient + b' :' + content + b'\r\n'
+    if recipient.startswith(b'#'):
+        channel_lower = recipient.lower()
+        channel = channels.get(channel_lower)
+        if not channel or conexao not in channel:
+            return
+        for member in channel:
+            if member != conexao:
+                member.enviar(msg)
+    else:
+        recipient_lower = recipient.lower()
+        target_con = nicknames.get(recipient_lower)
+        if target_con:
+            target_con.enviar(msg)
+
+def handle_join(conexao, parts):
+    if not conexao.registered or len(parts) < 2:
+        return
+    channel = parts[1]
+    if not channel.startswith(b'#'):
+        send_error(conexao, b'403', channel, b'No such channel')
+        return
+    if not validar_nome(channel[1:]):
+        send_error(conexao, b'403', channel, b'No such channel')
+        return
+    channel_lower = channel.lower()
+    if channel_lower not in channels:
+        channels[channel_lower] = set()
+    if conexao in channels[channel_lower]:
+        return
+    channels[channel_lower].add(conexao)
+    conexao.channels.add(channel_lower)
+    join_msg = b':' + conexao.nick + b' JOIN :' + channel + b'\r\n'
+    for member in channels[channel_lower]:
+        member.enviar(join_msg)
+    send_names_list(conexao, channel, channel_lower)
+
+def send_names_list(conexao, channel, channel_lower):
+    members = sorted([m.nick for m in channels[channel_lower] if m.nick], key=lambda x: x.lower())
+    prefix = b':server 353 ' + conexao.nick + b' = ' + channel + b' :'
+    max_line_length = 512 - len(prefix) - 2  
+
+    current_chunk = []
+    current_length = 0
+
+    for nick in members:
+        nick_bytes = nick
+        required_space = len(nick_bytes) + (1 if current_chunk else 0)
+        if current_length + required_space > max_line_length:
+            line = prefix + b' '.join(current_chunk) + b'\r\n'
+            conexao.enviar(line)
+            current_chunk = [nick_bytes]
+            current_length = len(nick_bytes)
+        else:
+            current_chunk.append(nick_bytes)
+            current_length += required_space
+
+    if current_chunk:
+        line = prefix + b' '.join(current_chunk) + b'\r\n'
+        conexao.enviar(line)
+
+    end_msg = b':server 366 ' + conexao.nick + b' ' + channel + b' :End of /NAMES list.\r\n'
+    conexao.enviar(end_msg)
+
+def handle_part(conexao, parts):
+    if not conexao.registered or len(parts) < 2:
+        return
+    channel = parts[1]
+    channel_lower = channel.lower()
+    if channel_lower not in channels or conexao not in channels[channel_lower]:
+        return
+    current_members = channels[channel_lower].copy()
+    part_msg = b':' + conexao.nick + b' PART ' + channel + b'\r\n'
+    for member in current_members:
+        member.enviar(part_msg)
+    channels[channel_lower].remove(conexao)
+    conexao.channels.discard(channel_lower)
+    if not channels[channel_lower]:
+        del channels[channel_lower]
 
 def conexao_aceita(conexao):
     print(conexao, 'nova conexão')
+    conexao.buffer = b''
+    conexao.nick = None
+    conexao.registered = False
+    conexao.channels = set()
     conexao.registrar_recebedor(dados_recebidos)
-
 
 servidor = Servidor(6667)
 servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
